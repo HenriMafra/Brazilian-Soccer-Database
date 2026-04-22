@@ -29,25 +29,33 @@ CORES_COMP = "Set2"
 @st.cache_data(show_spinner="⬇️ Baixando dataset do Kaggle…")
 def carregar_dados():
     import kagglehub
+    import glob # Importação adicionada para busca inteligente de arquivos
 
     path = kagglehub.dataset_download(
         "ricardomattos05/jogos-do-campeonato-brasileiro"
     )
 
     dfs = []
-    for arquivo in os.listdir(path):
-        if arquivo.endswith(".csv"):
-            df_temp = pd.read_csv(os.path.join(path, arquivo))
-            df_temp["competicao"] = arquivo.replace(".csv", "")
-            dfs.append(df_temp)
+    
+    # Busca todos os arquivos .csv, inclusive dentro de subpastas (recursive=True)
+    caminhos_csv = glob.glob(os.path.join(path, "**", "*.csv"), recursive=True)
+    
+    for caminho_arquivo in caminhos_csv:
+        df_temp = pd.read_csv(caminho_arquivo)
+        # Extrai apenas o nome do arquivo para usar como competição
+        nome_arquivo = os.path.basename(caminho_arquivo)
+        df_temp["competicao"] = nome_arquivo.replace(".csv", "")
+        dfs.append(df_temp)
+
+    # ── Trava de Segurança ────────────────────────────────────────────────────
+    if not dfs:
+        st.error(f"Nenhum arquivo CSV encontrado na pasta: {path}")
+        return pd.DataFrame() # Retorna df vazio para não quebrar o app
 
     df = pd.concat(dfs, ignore_index=True)
 
     # ── Tipos ─────────────────────────────────────────────────────────────────
-    # Detecta automaticamente a coluna de data
-    col_data = next(
-        (c for c in df.columns if "data" in c.lower()), None
-    )
+    col_data = next((c for c in df.columns if "data" in c.lower()), None)
     if col_data:
         df[col_data] = pd.to_datetime(df[col_data], errors="coerce")
         df["_data"]  = df[col_data]
