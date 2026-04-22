@@ -40,11 +40,19 @@ def carregar_dados():
     # Busca todos os arquivos .csv, inclusive dentro de subpastas (recursive=True)
     caminhos_csv = glob.glob(os.path.join(path, "**", "*.csv"), recursive=True)
     
-    for caminho_arquivo in caminhos_csv:
+     for caminho_arquivo in caminhos_csv:
         df_temp = pd.read_csv(caminho_arquivo)
-        # Extrai apenas o nome do arquivo para usar como competição
-        nome_arquivo = os.path.basename(caminho_arquivo)
-        df_temp["competicao"] = nome_arquivo.replace(".csv", "")
+        
+        # 1. Pega o nome do arquivo (ex: Brasileirao_Matches.csv)
+        nome_limpo = os.path.basename(caminho_arquivo).replace(".csv", "")
+        
+        # 2. Remove os "Matches" e os underlines "_"
+        nome_limpo = nome_limpo.replace("_Matches", "").replace("_matches", "").replace("_", " ")
+        
+        # 3. Transforma tudo em Título (Ex: brasileirao -> Brasileirao)
+        # Isso evita que apareça "Brasileirao" e "brasileirao" separadamente
+        df_temp["competicao"] = nome_limpo.strip().title()
+        
         dfs.append(df_temp)
 
     # ── Trava de Segurança ────────────────────────────────────────────────────
