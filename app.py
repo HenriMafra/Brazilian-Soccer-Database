@@ -3,365 +3,339 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import numpy as np
+from datetime import datetime
 
-# ── Streamlit Cloud: injeta credenciais do Kaggle via st.secrets ──────────────
+# ── CONFIGURAÇÕES KAGGLE ──────────────────────────────────────────────────────
 if "KAGGLE_USERNAME" in st.secrets:
     os.environ["KAGGLE_USERNAME"] = st.secrets["KAGGLE_USERNAME"]
     os.environ["KAGGLE_KEY"]      = st.secrets["KAGGLE_KEY"]
 
-# ── Configuração da página ────────────────────────────────────────────────────
+# ── CONFIGURAÇÃO DA PÁGINA ────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Futebol Brasileiro · EDA",
+    page_title="Brasil FutStat Pro · Advanced EDA",
     page_icon="⚽",
     layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# ── Paleta / estilo global ────────────────────────────────────────────────────
+# ── ESTILIZAÇÃO E CONSTANTES ──────────────────────────────────────────────────
 sns.set_theme(style="whitegrid")
-VERDE   = "#1DB954"
-AMARELO = "#F5C518"
-AZUL    = "#1565C0"
-CORES_COMP = "Set2"
+VERDE_BRASIL = "#009739"
+AMARELO_BRASIL = "#FEDD00"
+AZUL_BRASIL = "#002776"
+PALETA_QUENTE = "YlOrRd"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CARREGAMENTO DOS DADOS (cacheado — só baixa uma vez por sessão)
-# ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner="⬇️ Baixando dataset do Kaggle…")
-def carregar_dados():
+# ── LÓGICA DE TRATAMENTO DE DADOS ─────────────────────────────────────────────
+@st.cache_data(show_spinner="⏳ Minerando dados do Kaggle...")
+def carregar_e_limpar_dados():
     import kagglehub
-    import glob # Importação adicionada para busca inteligente de arquivos
+    import glob
 
-    path = kagglehub.dataset_download(
-        "ricardomattos05/jogos-do-campeonato-brasileiro"
-    )
-
-    dfs = []
-    
-    # Busca todos os arquivos .csv, inclusive dentro de subpastas (recursive=True)
+    path = kagglehub.dataset_download("ricardomattos05/jogos-do-campeonato-brasileiro")
     caminhos_csv = glob.glob(os.path.join(path, "**", "*.csv"), recursive=True)
     
-     for caminho_arquivo in caminhos_csv:
-        df_temp = pd.read_csv(caminho_arquivo)
-        
-        # 1. Pega o nome do arquivo (ex: Brasileirao_Matches.csv)
-        nome_limpo = os.path.basename(caminho_arquivo).replace(".csv", "")
-        
-        # 2. Remove os "Matches" e os underlines "_"
-        nome_limpo = nome_limpo.replace("_Matches", "").replace("_matches", "").replace("_", " ")
-        
-        # 3. Transforma tudo em Título (Ex: brasileirao -> Brasileirao)
-        # Isso evita que apareça "Brasileirao" e "brasileirao" separadamente
-        df_temp["competicao"] = nome_limpo.strip().title()
-        
-        dfs.append(df_temp)
+    dfs = []
+    for arq in caminhos_csv:
+        try:
+            df_temp = pd.read_csv(arq)
+            # Limpeza do nome da competição
+            nome = os.path.basename(arq).lower().replace(".csv", "")
+            nome = nome.replace("_matches", "").replace("_", " ")
+            df_temp["competicao"] = nome.strip().title()
+            dfs.append(df_temp)
+        except Exception as e:
+            st.warning(f"Erro ao ler {arq}: {e}")
 
-    # ── Trava de Segurança ────────────────────────────────────────────────────
     if not dfs:
-        st.error(f"Nenhum arquivo CSV encontrado na pasta: {path}")
-        return pd.DataFrame() # Retorna df vazio para não quebrar o app
+        return pd.DataFrame()
 
     df = pd.concat(dfs, ignore_index=True)
 
-    # ── Tipos ─────────────────────────────────────────────────────────────────
-    col_data = next((c for c in df.columns if "data" in c.lower()), None)
-    if col_data:
-        df[col_data] = pd.to_datetime(df[col_data], errors="coerce")
-        df["_data"]  = df[col_data]
-        df["_ano"]   = df[col_data].dt.year
+    # Padronização de Colunas (Trata variações de nomes no CSV)
+    mapa_colunas = {
+        'Data': 'data', 'Date': 'data',
+        'Mandante': 'mandante', 'Home': 'mandante',
+        'Visitante': 'visitante', 'Away': 'visitante',
+        'Gols Mandante': 'gols_mandante', 'HomeGoals': 'gols_mandante',
+        'Gols Visitante': 'gols_visitante', 'AwayGoals': 'gols_visitante'
+    }
+    df = df.rename(columns=mapa_colunas)
 
-    for col in ["gols_mandante", "gols_visitante"]:
+    # Conversão de tipos
+    if 'data' in df.columns:
+        df['data'] = pd.to_datetime(df['data'], errors='coerce')
+        df = df.dropna(subset=['data'])
+        df['_ano'] = df['data'].dt.year
+        df['_mes'] = df['data'].dt.month
+        df['_dia_semana'] = df['data'].dt.day_name()
+
+    cols_gols = ['gols_mandante', 'gols_visitante']
+    for col in cols_gols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
 
-    if "gols_mandante" in df.columns and "gols_visitante" in df.columns:
-        df["total_gols"] = df["gols_mandante"] + df["gols_visitante"]
+    # --- FEATURE ENGINEERING (Criação de métricas) ---
+    if all(c in df.columns for c in cols_gols):
+        df['total_gols'] = df['gols_mandante'] + df['gols_visitante']
+        df['saldo_gols'] = df['gols_mandante'] - df['gols_visitante']
+        
+        # Resultado do jogo
+        condicoes = [
+            (df['gols_mandante'] > df['gols_visitante']),
+            (df['gols_mandante'] < df['gols_visitante']),
+            (df['gols_mandante'] == df['gols_visitante'])
+        ]
+        escolhas = ['Mandante', 'Visitante', 'Empate']
+        df['resultado'] = np.select(condicoes, escolhas, default='Indefinido')
+        
+        # Pontuação (Simulada para análise)
+        df['pts_mandante'] = np.select([df['resultado'] == 'Mandante', df['resultado'] == 'Empate'], [3, 1], 0)
+        df['pts_visitante'] = np.select([df['resultado'] == 'Visitante', df['resultado'] == 'Empate'], [3, 1], 0)
 
     return df
 
+df_raw = carregar_e_limpar_dados()
 
-df = carregar_dados()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────────────────────────────────────────
+# ── SIDEBAR E FILTROS ─────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image(
-        "https://upload.wikimedia.org/wikipedia/pt/4/42/CBF_logo.svg",
-        width=80,
-    )
-    st.title("⚽ Futebol Brasileiro")
-    st.caption("Análise Exploratória de Dados · Aula 9")
-    st.divider()
-
-    secao = st.radio(
-        "Navegação",
-        [
-            "📋 Visão Geral",
-            "🏟️ Times e Competições",
-            "⚽ Análise de Gols",
-            "📅 Evolução Temporal",
-            "🔍 Relações entre Variáveis",
-        ],
+    st.image("https://upload.wikimedia.org/wikipedia/pt/4/42/CBF_logo.svg", width=100)
+    st.title("⚽ Brasil FutStat Pro")
+    st.markdown("---")
+    
+    menu = st.selectbox(
+        "Navegação Principal",
+        ["🏠 Dashboard Inicial", "📈 Análise de Desempenho", "⚔️ Head-to-Head", 
+         "🥅 Raio-X dos Gols", "📅 Tendências Temporais", "🧪 Laboratório de Dados"]
     )
 
-    st.divider()
+    st.subheader("🛠️ Filtros Globais")
+    todas_comp = sorted(df_raw['competicao'].unique())
+    filtro_comp = st.multiselect("Competições", todas_comp, default=todas_comp[:3])
+    
+    anos = sorted(df_raw['_ano'].unique().astype(int))
+    filtro_anos = st.select_slider("Recorte Temporal", options=anos, value=(min(anos), max(anos)))
 
-    # Filtros globais
-    competicoes_disponiveis = sorted(df["competicao"].dropna().unique())
-    filtro_comp = st.multiselect(
-        "Filtrar competições",
-        competicoes_disponiveis,
-        default=competicoes_disponiveis,
-    )
+    st.markdown("---")
+    st.caption(f"Última atualização: {datetime.now().strftime('%d/%m/%Y')}")
 
-    if "_ano" in df.columns:
-        ano_min = int(df["_ano"].min())
-        ano_max = int(df["_ano"].max())
-        filtro_anos = st.slider(
-            "Período",
-            ano_min, ano_max,
-            (ano_min, ano_max),
+# Aplicação dos filtros no DataFrame principal
+df = df_raw[
+    (df_raw['competicao'].isin(filtro_comp)) & 
+    (df_raw['_ano'].between(filtro_anos[0], filtro_anos[1]))
+].copy()
+
+# ── FUNÇÕES DE APOIO PARA GRÁFICOS ────────────────────────────────────────────
+def plot_style(title, xlabel, ylabel):
+    plt.title(title, fontsize=16, fontweight='bold', pad=20)
+    plt.xlabel(xlabel, fontsize=12)
+    plt.ylabel(ylabel, fontsize=12)
+    plt.tight_layout()
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 1: DASHBOARD INICIAL
+# ═════════════════════════════════════════════════════════════════════════════
+if menu == "🏠 Dashboard Inicial":
+    st.header("📋 Visão Geral do Ecossistema")
+    
+    # KPIs Superiores
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    with kpi1:
+        st.metric("Total de Partidas", f"{len(df):,}")
+    with kpi2:
+        media_g = df['total_gols'].mean()
+        st.metric("Média de Gols/Jogo", f"{media_g:.2f}")
+    with kpi3:
+        v_casa = (df['resultado'] == 'Mandante').sum() / len(df) * 100
+        st.metric("% Vitórias Casa", f"{v_casa:.1f}%")
+    with kpi4:
+        st.metric("Times Analisados", df['mandante'].nunique())
+
+    st.markdown("---")
+    
+    col_left, col_right = st.columns([2, 1])
+    
+    with col_left:
+        st.subheader("🔥 Top 10 Times com Mais Pontos Acumulados (Recorte)")
+        # Cálculo de pontos totais
+        m_pts = df.groupby('mandante')['pts_mandante'].sum()
+        v_pts = df.groupby('visitante')['pts_visitante'].sum()
+        total_pts = m_pts.add(v_pts, fill_value=0).sort_values(ascending=False).head(10)
+        
+        fig, ax = plt.subplots(figsize=(10, 5))
+        sns.barplot(x=total_pts.values, y=total_pts.index, palette="viridis", ax=ax)
+        plot_style("Ranking de Pontuação Acumulada", "Pontos", "Clubes")
+        st.pyplot(fig)
+
+    with col_right:
+        st.subheader("⚖️ Distribuição de Resultados")
+        fig, ax = plt.subplots()
+        df['resultado'].value_counts().plot.pie(
+            autopct='%1.1f%%', colors=[AZUL_BRASIL, VERDE_BRASIL, 'gray'], 
+            startangle=90, ax=ax, explode=(0.05, 0, 0)
         )
+        ax.set_ylabel("")
+        st.pyplot(fig)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 2: ANÁLISE DE DESEMPENHO
+# ═════════════════════════════════════════════════════════════════════════════
+elif menu == "📈 Análise de Desempenho":
+    st.header("📈 Rankings e Performance por Competição")
+    
+    comp_alvo = st.selectbox("Selecione a Competição para Detalhar", filtro_comp)
+    df_comp = df[df['competicao'] == comp_alvo]
+
+    tab1, tab2 = st.tabs(["🛡️ Melhores Defesas", "⚔️ Melhores Ataques"])
+    
+    with tab1:
+        # Gols sofridos em casa + fora
+        gs_casa = df_comp.groupby('mandante')['gols_visitante'].sum()
+        gs_fora = df_comp.groupby('visitante')['gols_mandante'].sum()
+        defesa = gs_casa.add(gs_fora, fill_value=0).sort_values().head(10)
+        
+        st.subheader(f"Muralhas: Menos gols sofridos em {comp_alvo}")
+        fig, ax = plt.subplots(figsize=(10, 4))
+        sns.barplot(x=defesa.index, y=defesa.values, color="darkred")
+        plt.xticks(rotation=45)
+        st.pyplot(fig)
+
+    with tab2:
+        # Gols marcados em casa + fora
+        gm_casa = df_comp.groupby('mandante')['gols_mandante'].sum()
+        gm_fora = df_comp.groupby('visitante')['gols_visitante'].sum()
+        ataque = gm_casa.add(gm_fora, fill_value=0).sort_values(ascending=False).head(10)
+        
+        st.subheader(f"Artilharia Coletiva: Mais gols marcados em {comp_alvo}")
+        fig, ax = plt.subplots(figsize=(10, 4))
+        sns.barplot(x=ataque.index, y=ataque.values, color="darkgreen")
+        plt.xticks(rotation=45)
+        st.pyplot(fig)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 3: HEAD-TO-HEAD (CONFRONTO DIRETO)
+# ═════════════════════════════════════════════════════════════════════════════
+elif menu == "⚔️ Head-to-Head":
+    st.header("⚔️ Confronto Direto (Head-to-Head)")
+    
+    c1, c2 = st.columns(2)
+    time_a = c1.selectbox("Time A", sorted(df['mandante'].unique()), index=0)
+    time_b = c2.selectbox("Time B", sorted(df['visitante'].unique()), index=1)
+
+    confrontos = df[
+        ((df['mandante'] == time_a) & (df['visitante'] == time_b)) |
+        ((df['mandante'] == time_b) & (df['visitante'] == time_a))
+    ]
+
+    if confrontos.empty:
+        st.warning("Não foram encontrados jogos entre essas duas equipes no período selecionado.")
     else:
-        filtro_anos = None
+        st.subheader(f"Histórico: {time_a} vs {time_b}")
+        
+        # Estatísticas do Confronto
+        v_a = len(confrontos[confrontos['vencedor' if 'vencedor' in confrontos else 'resultado'] == (time_a if 'vencedor' in confrontos else 'Mandante')]) # Lógica simplificada
+        # Re-calculando vencedor real para o H2H
+        def get_winner(row):
+            if row['gols_mandante'] > row['gols_visitante']: return row['mandante']
+            if row['gols_visitante'] > row['gols_mandante']: return row['visitante']
+            return "Empate"
+        
+        confrontos['vencedor_real'] = confrontos.apply(get_winner, axis=1)
+        res_h2h = confrontos['vencedor_real'].value_counts()
+        
+        h_col1, h_col2, h_col3 = st.columns(3)
+        h_col1.metric(f"Vitórias {time_a}", res_h2h.get(time_a, 0))
+        h_col2.metric(f"Vitórias {time_b}", res_h2h.get(time_b, 0))
+        h_col3.metric("Empates", res_h2h.get("Empate", 0))
 
-    st.caption("Dataset: [Kaggle ↗](https://www.kaggle.com/datasets/ricardomattos05/jogos-do-campeonato-brasileiro)")
-
-# ── Aplica filtros ─────────────────────────────────────────────────────────
-df_f = df[df["competicao"].isin(filtro_comp)].copy()
-if filtro_anos and "_ano" in df_f.columns:
-    df_f = df_f[df_f["_ano"].between(filtro_anos[0], filtro_anos[1])]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# helper para exibir gráficos matplotlib no Streamlit
-# ─────────────────────────────────────────────────────────────────────────────
-def show(fig):
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SEÇÃO 1 — VISÃO GERAL
-# ═════════════════════════════════════════════════════════════════════════════
-if secao == "📋 Visão Geral":
-    st.header("📋 Visão Geral do Dataset")
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total de Jogos",       f"{len(df_f):,}")
-    col2.metric("Competições",          df_f["competicao"].nunique())
-    if "mandante" in df_f.columns:
-        col3.metric("Times Únicos",
-                    df_f["mandante"].nunique())
-    if "_ano" in df_f.columns:
-        col4.metric("Anos cobertos",
-                    f"{int(df_f['_ano'].min())} – {int(df_f['_ano'].max())}")
-
-    st.divider()
-    st.subheader("Amostra dos dados")
-    st.dataframe(df_f.head(20), use_container_width=True)
-
-    st.subheader("Estatísticas descritivas")
-    st.dataframe(df_f.describe(), use_container_width=True)
-
+        st.dataframe(confrontos[['data', 'competicao', 'mandante', 'gols_mandante', 'gols_visitante', 'visitante']], use_container_width=True)
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SEÇÃO 2 — TIMES E COMPETIÇÕES
+# SEÇÃO 4: RAIO-X DOS GOLS
 # ═════════════════════════════════════════════════════════════════════════════
-elif secao == "🏟️ Times e Competições":
-    st.header("🏟️ Times e Competições")
+elif menu == "🥅 Raio-X dos Gols":
+    st.header("🥅 Análise Estatística de Placares")
+    
+    col_l, col_r = st.columns(2)
+    
+    with col_l:
+        st.subheader("Distribuição de Gols Totais")
+        fig, ax = plt.subplots()
+        sns.histplot(df['total_gols'], kde=True, bins=15, color="purple", ax=ax)
+        st.pyplot(fig)
+        st.info("💡 A maioria dos jogos brasileiros termina com 2 ou 3 gols.")
 
-    # ── Gráfico 1: Jogos por competição (Pandas Plot → Matplotlib) ────────────
-    st.subheader("Gráfico 1 — Jogos por Competição")
-    st.caption("Pandas Plot · `value_counts().plot(kind='bar')`")
+    with col_r:
+        st.subheader("Heatmap de Placares (Frequência)")
+        matrix_placar = df.pivot_table(index='gols_mandante', columns='gols_visitante', aggfunc='size', fill_value=0)
+        fig, ax = plt.subplots()
+        sns.heatmap(matrix_placar, annot=True, fmt='d', cmap=PALETA_QUENTE, ax=ax)
+        ax.invert_yaxis()
+        st.pyplot(fig)
 
-    jogos_comp = df_f["competicao"].value_counts()
+# ═════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 5: TENDÊNCIAS TEMPORAIS
+# ═════════════════════════════════════════════════════════════════════════════
+elif menu == "📅 Tendências Temporais":
+    st.header("📅 Evolução do Futebol ao Longo dos Anos")
+    
+    tab_ano, tab_mes = st.tabs(["🗓️ Por Ano", "🕒 Por Mês"])
+    
+    with tab_ano:
+        evo_gols = df.groupby('_ano')['total_gols'].mean()
+        fig, ax = plt.subplots(figsize=(12, 5))
+        evo_gols.plot(kind="line", marker="s", color=AZUL_BRASIL, linewidth=3, ax=ax)
+        plot_style("Média de Gols por Ano", "Ano", "Gols/Jogo")
+        st.pyplot(fig)
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    jogos_comp.plot(kind="bar", ax=ax, color=VERDE)
-    ax.set_title("Número de Jogos por Competição", fontsize=13)
-    ax.set_xlabel("Competição")
-    ax.set_ylabel("Número de Jogos")
-    ax.tick_params(axis="x", rotation=35)
-    fig.tight_layout()
-    show(fig)
-
-    # ── Gráfico 2: Top 10 mandantes (Matplotlib) ──────────────────────────────
-    if "mandante" in df_f.columns:
-        st.subheader("Gráfico 2 — Top 10 Times como Mandante")
-        st.caption("Matplotlib · personalização completa")
-
-        top10 = df_f["mandante"].value_counts().head(10)
-
+    with tab_mes:
+        st.subheader("Volume de Jogos por Mês (Sazonalidade)")
+        ordem_meses = [1,2,3,4,5,6,7,8,9,10,11,12]
+        jogos_mes = df.groupby('_mes').size().reindex(ordem_meses)
         fig, ax = plt.subplots(figsize=(10, 4))
-        top10.plot(kind="bar", ax=ax, color=AZUL)
-        ax.set_title("Top 10 Times com Mais Jogos em Casa", fontsize=13)
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Jogos")
-        ax.tick_params(axis="x", rotation=40)
-        fig.tight_layout()
-        show(fig)
-
-    # ── Gráfico 3: Seaborn barplot ────────────────────────────────────────────
-    if "total_gols" in df_f.columns:
-        st.subheader("Gráfico 3 — Média de Gols por Competição (Seaborn)")
-        st.caption("Seaborn · `sns.barplot` com `as_index=False`")
-
-        media_gols = (
-            df_f.groupby("competicao", as_index=False)["total_gols"].mean()
-        )
-
-        fig, ax = plt.subplots(figsize=(10, 4))
-        sns.barplot(
-            data=media_gols,
-            x="competicao",
-            y="total_gols",
-            palette=CORES_COMP,
-            ax=ax,
-        )
-        ax.set_title("Média de Gols por Partida — por Competição", fontsize=13)
-        ax.set_xlabel("Competição")
-        ax.set_ylabel("Média de Gols")
-        ax.tick_params(axis="x", rotation=35)
-        fig.tight_layout()
-        show(fig)
-
+        sns.barplot(x=jogos_mes.index, y=jogos_mes.values, palette="coolwarm", ax=ax)
+        st.pyplot(fig)
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SEÇÃO 3 — ANÁLISE DE GOLS
+# SEÇÃO 6: LABORATÓRIO DE DADOS (AVANÇADO)
 # ═════════════════════════════════════════════════════════════════════════════
-elif secao == "⚽ Análise de Gols":
-    st.header("⚽ Análise de Gols")
+elif menu == "🧪 Laboratório de Dados":
+    st.header("🧪 Laboratório de Análise Avançada")
+    
+    st.markdown("""
+    Nesta seção, exploramos correlações e detecção de anomalias (Outliers).
+    """)
+    
+    exp1 = st.expander("🔍 Correlação de Variáveis")
+    with exp1:
+        corr = df[['gols_mandante', 'gols_visitante', 'total_gols', 'saldo_gols', '_ano', 'pts_mandante']].corr()
+        fig, ax = plt.subplots()
+        sns.heatmap(corr, annot=True, cmap="RdBu", center=0, ax=ax)
+        st.pyplot(fig)
 
-    if "total_gols" not in df_f.columns:
-        st.warning("Colunas `gols_mandante` / `gols_visitante` não encontradas.")
-        st.stop()
+    exp2 = st.expander("🚨 Jogos Atípicos (Goleadas Históricas)")
+    with exp2:
+        goleadas = df[df['total_gols'] >= 7].sort_values(by='total_gols', ascending=False)
+        st.write("Partidas com 7 ou mais gols encontrados:")
+        st.table(goleadas[['data', 'mandante', 'gols_mandante', 'gols_visitante', 'visitante', 'competicao']])
 
-    # ── Gráfico 4: Histograma ─────────────────────────────────────────────────
-    st.subheader("Gráfico 4 — Distribuição de Gols por Partida")
-    st.caption("Seaborn · `sns.histplot` com `kde=True`")
+    st.markdown("---")
+    st.subheader("💾 Exportar Dados Filtrados")
+    @st.cache_data
+    def convert_df(df_to_save):
+        return df_to_save.to_csv(index=False).encode('utf-8')
 
-    bins = st.slider("Número de bins", 5, 30, 15)
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    sns.histplot(
-        df_f["total_gols"].dropna(),
-        bins=bins,
-        kde=True,
-        color="salmon",
-        ax=ax,
+    csv_data = convert_df(df)
+    st.download_button(
+        label="Download CSV dos Filtros Atuais",
+        data=csv_data,
+        file_name='futebol_brasileiro_filtrado.csv',
+        mime='text/csv',
     )
-    ax.set_title("Distribuição do Total de Gols por Partida", fontsize=13)
-    ax.set_xlabel("Total de Gols")
-    ax.set_ylabel("Frequência")
-    fig.tight_layout()
-    show(fig)
 
-    # ── Gráfico 5: Boxplot ────────────────────────────────────────────────────
-    st.subheader("Gráfico 5 — Boxplot de Gols por Competição")
-    st.caption("Seaborn · `sns.boxplot` — identifica outliers (placar alto)")
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    sns.boxplot(
-        data=df_f,
-        x="competicao",
-        y="total_gols",
-        palette=CORES_COMP,
-        ax=ax,
-    )
-    ax.set_title("Boxplot do Total de Gols por Competição", fontsize=13)
-    ax.set_xlabel("Competição")
-    ax.set_ylabel("Total de Gols")
-    ax.tick_params(axis="x", rotation=35)
-    fig.tight_layout()
-    show(fig)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SEÇÃO 4 — EVOLUÇÃO TEMPORAL
-# ═════════════════════════════════════════════════════════════════════════════
-elif secao == "📅 Evolução Temporal":
-    st.header("📅 Evolução Temporal")
-
-    if "_ano" not in df_f.columns:
-        st.warning("Coluna de data não encontrada no dataset.")
-        st.stop()
-
-    # ── Gráfico 6: Jogos por ano ──────────────────────────────────────────────
-    st.subheader("Gráfico 6 — Jogos Registrados por Ano")
-    st.caption("Pandas Plot · `kind='line'` com `marker='o'`")
-
-    jogos_ano = df_f.groupby("_ano")["competicao"].count()
-
-    fig, ax = plt.subplots(figsize=(12, 4))
-    jogos_ano.plot(kind="line", marker="o", color="teal", ax=ax)
-    ax.set_title("Número de Jogos Registrados por Ano", fontsize=13)
-    ax.set_xlabel("Ano")
-    ax.set_ylabel("Número de Jogos")
-    ax.grid(axis="y", linestyle="--", alpha=0.5)
-    fig.tight_layout()
-    show(fig)
-
-    # ── Gráfico 7: Mandante vs Visitante ──────────────────────────────────────
-    if "gols_mandante" in df_f.columns and "gols_visitante" in df_f.columns:
-        st.subheader("Gráfico 7 — Média de Gols por Ano: Mandante vs Visitante")
-        st.caption("Pandas Plot · `groupby + unstack` para duas linhas")
-
-        gols_ano = (
-            df_f.groupby("_ano")[["gols_mandante", "gols_visitante"]]
-            .mean()
-        )
-
-        fig, ax = plt.subplots(figsize=(12, 4))
-        gols_ano.plot(kind="line", marker="o", ax=ax,
-                      color=[AZUL, AMARELO])
-        ax.set_title(
-            "Média de Gols por Ano — Mandante vs Visitante", fontsize=13
-        )
-        ax.set_xlabel("Ano")
-        ax.set_ylabel("Média de Gols")
-        ax.legend(["Mandante", "Visitante"])
-        ax.grid(axis="y", linestyle="--", alpha=0.5)
-        fig.tight_layout()
-        show(fig)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SEÇÃO 5 — RELAÇÕES ENTRE VARIÁVEIS
-# ═════════════════════════════════════════════════════════════════════════════
-elif secao == "🔍 Relações entre Variáveis":
-    st.header("🔍 Relações entre Variáveis")
-
-    if "gols_mandante" not in df_f.columns or "gols_visitante" not in df_f.columns:
-        st.warning("Colunas de gols não encontradas.")
-        st.stop()
-
-    # ── Gráfico 8: Scatter ────────────────────────────────────────────────────
-    st.subheader("Gráfico 8 — Gols Mandante × Gols Visitante")
-    st.caption("Seaborn · `sns.scatterplot` com `hue` por competição")
-
-    n_amostra = st.slider("Tamanho da amostra", 500, 5000, 2000, step=500)
-    df_clean = df_f.dropna(subset=["gols_mandante", "gols_visitante"])
-    n_amostra = min(n_amostra, len(df_clean))
-    amostra = df_clean.sample(n_amostra, random_state=42)
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    sns.scatterplot(
-        data=amostra,
-        x="gols_mandante",
-        y="gols_visitante",
-        hue="competicao",
-        palette=CORES_COMP,
-        alpha=0.5,
-        ax=ax,
-    )
-    ax.set_title("Gols Mandante × Gols Visitante", fontsize=13)
-    ax.set_xlabel("Gols Mandante")
-    ax.set_ylabel("Gols Visitante")
-    fig.tight_layout()
-    show(fig)
-
-    st.info(
-        "💡 Cada ponto é uma partida. A diagonal imaginável (x=y) representa empate. "
-        "Pontos acima dela = mais gols do visitante."
-    )
+# ── RODAPÉ ────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.markdown(
+    f"<div style='text-align: center'>Desenvolvido para análise de Dados Esportivos · 2026 · {len(df_raw)} linhas processadas</div>", 
+    unsafe_allow_html=True
+)
